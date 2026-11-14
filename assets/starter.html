@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Blockout · 动漫风 3D 场景骨架</title>
+<!--
+  用途：本文件是 Stage 2（白模）的起点，也可作为 Stage 3–9 的合并底座。
+  阶段标记（搜 STAGE 定位）：
+    STAGE2  相机/构图/几何  —— 本文件已包含
+    STAGE3  换 toon 材质（把 toon() 的 gray 参数换成 palette 色）+ 描边已就绪
+    STAGE4  天空/雾/灯光参数已就位，取消 SKY_ENABLED 注释即可
+    STAGE5  composer 链已就位，CONFIG.post.* 直接调
+    STAGE6  updateParticles / windShaders 已就位
+    STAGE7  OrbitControls + 视差已就位
+    STAGE8  resize / 降级 / DPR 上限已就位
+  设计约定：所有视觉参数只在 CONFIG 里改；正文不出现魔法数字。
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e18; }
+  canvas { display: block; touch-action: none; }
+  #hud {
+    position: fixed; left: 12px; top: 12px; z-index: 10;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #d7e6ff; background: rgba(8, 12, 22, .62);
+    border: 1px solid rgba(140, 180, 255, .18); border-radius: 8px;
+    padding: 8px 10px; white-space: pre; pointer-events: none;
+  }
+  #fallback {
+    position: fixed; inset: 0; display: none; place-content: center; text-align: center;
+    color: #dfe9ff; font: 14px/1.8 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 24px;
+  }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="fallback">当前浏览器无法初始化 WebGL，或三维库未能加载（离线时 CDN 不可达）。<br>请更新浏览器 / 检查网络后重试。</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls }   from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass }      from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
+import { mergeVertices }   from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* ============================================================
+ * 1. CONFIG —— 所有可调视觉参数集中在此
+ *    字段含义与取值范围见 references/config-reference.md
+ * ============================================================ */
+const CONFIG = {
+  meta: { title: 'Blockout' },
+
+  camera: {
+    fov: 45,
+    near: 0.1,
+    far: 800,
+    position: [9, 5.5, 13],
+    target: [0, 2.2, 0],
+    minDistance: 7,
+    maxDistance: 42,
+    maxPolarAngle: 1.45,     // 约 83°，防止相机钻到地平线以下
+    damping: 0.08,
+    parallax: { amount: 0.12, ease: 0.06 },
+  },
+
+  palette: {
+    skyTop: '#2b3d6b',
+    skyMid: '#6f8fc4',
+    skyBottom: '#e8c9a8',
+    sun: '#ffe8c0',
+    mainLight: '#ffd9a0',
+    fillSky: '#9db8e8',
+    fillGround: '#5b4a3a',
+    shadowTint: '#8fb2ff',
+    accent: '#ff6b6b',
+  },
+
+  toon: {
+    steps: 4,                              // 必须与 ramp.length 一致
+    ramp: [0.18, 0.40, 0.66, 1.0],
+    outline: { enabled: true, px: 1.8, color: '#241a33', fadeStart: 22, fadeEnd: 90 },
+  },
+
+  light: {
+    sunDir: [-0.55, 0.42, -0.72],
+    sunIntensity: 2.6,
+    ambient: 0.15,
+    hemi: { sky: '#9db8e8', ground: '#5b4a3a', intensity: 0.55 },
+    shadow: {
+      enabled: true, mapSize: 2048, cameraSize: 24,
+      bias: -0.0006, normalBias: 0.02, type: 'PCF',
+    },
+  },
+
+  sky: {
+    radius: 400,
+    bands: [0.42, 0.62],
+    softness: 0.04,
+    sunDisc: { enabled: true, size: 0.06, gain: 1.4 },
+    noise: 0.008,
+  },
+
+  fog: { enabled: true, color: '#e8c9a8', density: 0.018 },   // 建议与 palette.skyBottom 一致
+
+  post: {
+    enabled: true,
+    toneMapping: 'none',          // none | aces | linear
+    exposure: 1.0,
+    bloom: { strength: 0.55, radius: 0.4, threshold: 0.85 },
+    grade: {
+      saturation: 1.12, contrast: 1.06,
+      shadowTint: '#8fb2ff', highlightTint: '#ffd9a8', tintMix: 0.28, lift: 0.0,
+    },
+    vignette: { amount: 0.28, softness: 0.55 },
+  },
+
+  anim: {
+    wind: { strength: 0.12, speed: 1.1, freq: 1.8 },
+    particles: {
+      mode: 'petal', count: 260, size: 0.35, opacity: 0.85,
+      fall: 0.9, drift: 0.5, bounds: 26,
+    },
+    autoRotate: { enabled: true, speed: 0.18, idleDelay: 3.0 },
+  },
+
+  perf: {
+    pixelRatioCap: 2,
+    mobilePixelRatioCap: 1.5,
+    shadowOnMobile: true,
+    outlineOnMobile: true,
+    bloomOnMobile: false,
+    adaptive: { enabled: true, minFps: 45, window: 2.0 },
+  },
+
+  debug: { hud: true },   // Stage 2 必须开，Stage 9 交付前改 false
+};
+
+/* ============================================================
+ * 2. 运行环境与渲染器
+ * ============================================================ */
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// 视口尺寸兜底：某些嵌入/无头浏览器启动时 innerWidth 为 0，
+// 直接拿它算 aspect 会得到 NaN，画面全黑且不报错 —— 这类问题极难查，故显式兜底。
+function viewSize() {
+  const w = innerWidth || document.documentElement.clientWidth || 1280;
+  const h = innerHeight || document.documentElement.clientHeight || 720;
+  return { w, h };
+}
+
+const IS_MOBILE = matchMedia('(pointer: coarse)').matches || viewSize().w < 820;
+
+const hudEl      = document.getElementById('hud');
+const fallbackEl = document.getElementById('fallback');
+if (!CONFIG.debug.hud) hudEl.style.display = 'none';
+
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: !IS_MOBILE, powerPreference: 'high-performance' });
+} catch (err) {
+  fallbackEl.style.display = 'grid';
+  throw err;
+}
+
+const TONEMAP = { none: THREE.NoToneMapping, aces: THREE.ACESFilmicToneMapping, linear: THREE.LinearToneMapping };
+const SHADOWTYPE = { Basic: THREE.BasicShadowMap, PCF: THREE.PCFShadowMap, VSM: THREE.VSMShadowMap };
+
+const dprCap = IS_MOBILE ? CONFIG.perf.mobilePixelRatioCap : CONFIG.perf.pixelRatioCap;
+const VS = viewSize();
+renderer.setPixelRatio(Math.min(devicePixelRatio, dprCap));
+renderer.setSize(VS.w, VS.h);
+renderer.outputColorSpace = THREE.SRGBColorSpace;                 // 只声明这一次
+renderer.toneMapping = TONEMAP[CONFIG.post.toneMapping] ?? THREE.NoToneMapping;
+renderer.toneMappingExposure = CONFIG.post.exposure;
+renderer.shadowMap.enabled = CONFIG.light.shadow.enabled && (!IS_MOBILE || CONFIG.perf.shadowOnMobile);
+renderer.shadowMap.type = SHADOWTYPE[CONFIG.light.shadow.type] ?? THREE.PCFShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+if (CONFIG.fog.enabled) {
+  scene.fog = new THREE.FogExp2(new THREE.Color(CONFIG.fog.color), CONFIG.fog.density);
+}
+
+const camera = new THREE.PerspectiveCamera(
+  CONFIG.camera.fov, VS.w / VS.h, CONFIG.camera.near, CONFIG.camera.far,
+);
+camera.position.set(...CONFIG.camera.position);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(...CONFIG.camera.target);
+controls.enableDamping = true;
+controls.dampingFactor = CONFIG.camera.damping;
+controls.minDistance = CONFIG.camera.minDistance;
+controls.maxDistance = CONFIG.camera.maxDistance;
+controls.maxPolarAngle = CONFIG.camera.maxPolarAngle;
+controls.enablePan = false;
+controls.autoRotate = CONFIG.anim.autoRotate.enabled && !REDUCED;
+controls.autoRotateSpeed = CONFIG.anim.autoRotate.speed;
+controls.update();
+
+/* ============================================================
+ * 3. 工具函数
+ * ============================================================ */
+
+// 3.1 色阶贴图：NearestFilter + 无 mipmap + NoColorSpace，三件缺一画面就发灰
+function makeToonRamp(ramp) {
+  const data = new Uint8Array(ramp.length * 4);
+  ramp.forEach((v, i) => {
+    const c = Math.round(Math.min(Math.max(v, 0), 1) * 255);
+    data.set([c, c, c, 255], i * 4);
+  });
+  const tex = new THREE.DataTexture(data, ramp.length, 1, THREE.RGBAFormat);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+const RAMP = makeToonRamp(CONFIG.toon.ramp);
+const toon = (hex, extra = {}) =>
+  new THREE.MeshToonMaterial({ color: new THREE.Color(hex), gradientMap: RAMP, ...extra });
+
+// 3.2 描边：光滑法线几何（删 uv 才能跨接缝合并）+ 视距补偿
+function smoothForOutline(geometry) {
+  const g = geometry.clone();
+  g.deleteAttribute('uv');                 // UV 接缝会阻止顶点合并
+  const merged = mergeVertices(g, 1e-4);
+  merged.computeVertexNormals();           // 角点法线取平均，描边不裂口
+  return merged;
+}
+
+// 像素 → 每单位视距的世界宽度。用 CSS 像素，DPR 变化不影响视觉粗细
+function pxToWorldWidth(px) {
+  const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+  return (px * 2 * tanHalf) / viewSize().h;
+}
+
+const outlineMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    uWidth:     { value: 0.0014 },
+    uColor:     { value: new THREE.Color(CONFIG.toon.outline.color) },
+    uFadeStart: { value: CONFIG.toon.outline.fadeStart },
+    uFadeEnd:   { value: CONFIG.toon.outline.fadeEnd },
+  },
+  vertexShader: /* glsl */`
+    uniform float uWidth, uFadeStart, uFadeEnd;
+    void main() {
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vec3 n  = normalize(normalMatrix * normal);
+      float dist = max(-mv.z, 0.001);
+      // 乘视距 => 屏幕空间近似恒定；再乘衰减 => 远景变细
+      float fade = mix(0.3, 1.0, 1.0 - smoothstep(uFadeStart, uFadeEnd, dist));
+      mv.xyz += n * uWidth * dist * fade;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: /* glsl */`
+    uniform vec3 uColor;
+    void main() { gl_FragColor = vec4(uColor, 1.0); }`,
+  side: THREE.BackSide,
+});
+
+function syncOutlineWidth() {
+  outlineMaterial.uniforms.uWidth.value = pxToWorldWidth(CONFIG.toon.outline.px);
+}
+
+const OUTLINE_ON = CONFIG.toon.outline.enabled && (!IS_MOBILE || CONFIG.perf.outlineOnMobile);
+
+function addOutline(mesh, geometryOverride) {
+  if (!OUTLINE_ON) return;
+  const geo = geometryOverride ?? mesh.geometry;
+  const hull = new THREE.Mesh(smoothForOutline(geo), outlineMaterial);
+  hull.castShadow = false;
+  hull.receiveShadow = false;
+  hull.frustumCulled = false;
+  mesh.add(hull);
+}
+
+// 3.3 风摆：顶点阶段位移，根部锁死
+const windShaders = [];
+function windify(material, { strength, speed, freq }) {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime  = { value: 0 };
+    shader.uniforms.uWind  = { value: strength };
+    shader.uniforms.uSpeed = { value: speed };
+    shader.uniforms.uFreq  = { value: freq };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `
+        #include <common>
+        uniform float uTime, uWind, uSpeed, uFreq;`)
+      .replace('#include <begin_vertex>', `
+        #include <begin_vertex>
+        float w = sin(uTime * uSpeed + position.y * uFreq) * 0.6
+                + sin(uTime * uSpeed * 0.37 + position.x * uFreq * 0.8) * 0.4;
+        float hWeight = smoothstep(0.0, 2.2, position.y);
+        transformed.x += w * uWind * hWeight;
+        transformed.z += w * uWind * 0.6 * hWeight;`);
+    windShaders.push(shader);
+  };
+  material.customProgramCacheKey = () => 'wind-toon';   // 缺这行会与普通 toon 共用编译缓存
+  return material;
+}
+
+// 3.4 量化测帧：把「像不像」变成数字（Stage 2 门禁用）
+const _box = new THREE.Box3();
+const _v = new THREE.Vector3();
+function measureFrame(subject) {
+  _box.setFromObject(subject);
+  const { min, max } = _box;
+  let minX = 1, maxX = -1, minY = 1, maxY = -1;
+  for (let i = 0; i < 8; i++) {
+    _v.set(i & 1 ? max.x : min.x, i & 2 ? max.y : min.y, i & 4 ? max.z : min.z).project(camera);
+    const sx = (_v.x + 1) / 2;
+    const sy = (1 - _v.y) / 2;
+    minX = Math.min(minX, sx); maxX = Math.max(maxX, sx);
+    minY = Math.min(minY, sy); maxY = Math.max(maxY, sy);
+  }
+  let horizonY = null;
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  fwd.y = 0;
+  if (fwd.lengthSq() > 1e-6) {
+    fwd.normalize();
+    const p = camera.position.clone().addScaledVector(fwd, 500);
+    p.y = camera.position.y;               // 与眼同高的无穷远点即地平线
+    p.project(camera);
+    horizonY = (1 - p.y) / 2;
+  }
+  return {
+    cx: +((minX + maxX) / 2).toFixed(3),
+    cy: +((minY + maxY) / 2).toFixed(3),
+    w: +(maxX - minX).toFixed(3),
+    h: +(maxY - minY).toFixed(3),
+    horizonY: horizonY === null ? null : +horizonY.toFixed(3),
+  };
+}
+
+// 3.5 确定性伪随机：保证每次刷新构图一致，否则测帧数据不可比
+let _seed = 20261111;
+function rnd() {
+  _seed = (_seed * 1664525 + 1013904223) % 4294967296;
+  return _seed / 4294967296;
+}
+
+/* ============================================================
+ * 4. 场景构建
+ * ============================================================ */
+const world = new THREE.Group();      // 视差作用于这一层，不动相机
+scene.add(world);
+
+const subject = new THREE.Group();    // 量化测帧的对象
+world.add(subject);
+
+// STAGE4：天空（ShaderMaterial 默认不含雾代码，不会被打白）
+function buildSky() {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTop:     { value: new THREE.Color(CONFIG.palette.skyTop) },
+      uMid:     { value: new THREE.Color(CONFIG.palette.skyMid) },
+      uBottom:  { value: new THREE.Color(CONFIG.palette.skyBottom) },
+      uSun:     { value: new THREE.Color(CONFIG.palette.sun) },
+      uB1:      { value: CONFIG.sky.bands[0] },
+      uB2:      { value: CONFIG.sky.bands[1] },
+      uSoft:    { value: CONFIG.sky.softness },
+      uNoise:   { value: CONFIG.sky.noise },
+      uSunDir:  { value: new THREE.Vector3(...CONFIG.light.sunDir).normalize() },
+      uSunSize: { value: CONFIG.sky.sunDisc.size },
+      uSunGain: { value: CONFIG.sky.sunDisc.enabled ? CONFIG.sky.sunDisc.gain : 0 },
+    },
+    vertexShader: /* glsl */`
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */`
+      uniform vec3  uTop, uMid, uBottom, uSun, uSunDir;
+      uniform float uB1, uB2, uSoft, uNoise, uSunSize, uSunGain;
+      varying vec3  vDir;
+      float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      void main() {
+        vec3  d = normalize(vDir);
+        float h = d.y * 0.5 + 0.5;
+        vec3  c = mix(uBottom, uMid, smoothstep(uB1 - uSoft, uB1 + uSoft, h));
+        c       = mix(c, uTop,      smoothstep(uB2 - uSoft, uB2 + uSoft, h));
+        float s = smoothstep(uSunSize, uSunSize * 0.55, distance(d, uSunDir));
+        c += uSun * s * uSunGain;
+        c += (hash(gl_FragCoord.xy) - 0.5) * uNoise;
+        gl_FragColor = vec4(c, 1.0);
+      }`,
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+  });
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(CONFIG.sky.radius, 32, 16), mat);
+  sky.frustumCulled = false;
+  return sky;
+}
+scene.add(buildSky());     // 天空挂在 scene 上，不随视差移动
+
+// 地面：轻微起伏，否则 Toon 下一整片纯色，看不出体积
+const groundGeo = new THREE.PlaneGeometry(300, 300, 80, 80);
+{
+  const p = groundGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i);
+    const flat = THREE.MathUtils.smoothstep(Math.hypot(x, y), 6, 30);  // 中心留平台
+    p.setZ(i, (Math.sin(x * 0.06) * 1.2 + Math.cos(y * 0.05) * 0.9) * flat);
+  }
+  groundGeo.computeVertexNormals();
+}
+const ground = new THREE.Mesh(groundGeo, toon('#8e8f9b'));
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+world.add(ground);
+
+// 主体：三个基本体拼一个「石构」，仅验证比例，不代表最终造型
+{
+  const stone = toon('#b9b2a6');
+  const pillar = new THREE.Mesh(new THREE.BoxGeometry(1.6, 5.2, 1.6), stone);
+  pillar.position.set(0, 2.6, 0);
+  pillar.castShadow = pillar.receiveShadow = true;
+  subject.add(pillar);
+  addOutline(pillar);
+
+  const lintel = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.5, 1.9), stone);
+  lintel.position.set(0, 5.45, 0);
+  lintel.castShadow = lintel.receiveShadow = true;
+  subject.add(lintel);
+  addOutline(lintel);
+
+  const orb = new THREE.Mesh(new THREE.IcosahedronGeometry(0.85, 1), toon(CONFIG.palette.accent));
+  orb.position.set(0, 6.6, 0);
+  orb.castShadow = true;
+  subject.add(orb);
+  addOutline(orb);
+}
+
+// 侧景：树与石，只为造层次，调构图时一起量
+{
+  const trunkMat = toon('#6d5a45');
+  const leafMat  = windify(toon('#5f8f6a'), CONFIG.anim.wind);
+  const rockMat  = toon('#9a9aa2');
+
+  const treeSpots = [[-8, 4], [7, -3], [-11, -6], [12, 1]];
+  treeSpots.forEach(([x, z], i) => {
+    const h = 3.4 + rnd() * 1.6;
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.32, h * 0.5, 8), trunkMat);
+    trunk.position.set(x, h * 0.25, z);
+    trunk.castShadow = true;
+    world.add(trunk);
+    addOutline(trunk);
+
+    const crown = new THREE.Mesh(new THREE.ConeGeometry(1.5 + rnd() * 0.5, h, 7), leafMat);
+    crown.position.set(x, h * 0.5 + h * 0.5 * 0.9, z);
+    crown.castShadow = true;
+    world.add(crown);
+    addOutline(crown);
+  });
+
+  const rockSpots = [[-4.2, 2.6], [4.6, 2.2], [-2.4, -3.4]];
+  rockSpots.forEach(([x, z]) => {
+    const r = 0.6 + rnd() * 0.7;
+    const rock = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 1), rockMat);
+    rock.position.set(x, r * 0.72, z);
+    rock.scale.set(1, 0.72 + rnd() * 0.3, 1);
+    rock.rotation.y = rnd() * Math.PI;
+    rock.castShadow = rock.receiveShadow = true;
+    world.add(rock);
+    addOutline(rock);
+  });
+}
+
+// 灯光
+const sun = new THREE.DirectionalLight(new THREE.Color(CONFIG.palette.mainLight), CONFIG.light.sunIntensity);
+sun.position.copy(new THREE.Vector3(...CONFIG.light.sunDir).normalize().multiplyScalar(60));
+sun.castShadow = renderer.shadowMap.enabled;
+sun.shadow.mapSize.set(CONFIG.light.shadow.mapSize, CONFIG.light.shadow.mapSize);
+const sc = sun.shadow.camera;
+sc.left = -CONFIG.light.shadow.cameraSize;
+sc.right = CONFIG.light.shadow.cameraSize;
+sc.top = CONFIG.light.shadow.cameraSize;
+sc.bottom = -CONFIG.light.shadow.cameraSize;
+sc.near = 1;
+sc.far = 200;
+sc.updateProjectionMatrix();
+sun.shadow.bias = CONFIG.light.shadow.bias;
+sun.shadow.normalBias = CONFIG.light.shadow.normalBias;
+scene.add(sun, sun.target);
+
+const hemi = new THREE.HemisphereLight(
+  new THREE.Color(CONFIG.light.hemi.sky),
+  new THREE.Color(CONFIG.light.hemi.ground),
+  CONFIG.light.hemi.intensity,
+);
+scene.add(hemi);
+scene.add(new THREE.AmbientLight(0xffffff, CONFIG.light.ambient));
+
+// 粒子
+function makeParticleTexture(mode) {
+  const S = 64, cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  if (mode === 'firefly') {
+    const rg = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    rg.addColorStop(0, 'rgba(255,255,255,1)');
+    rg.addColorStop(0.35, 'rgba(255,255,255,0.7)');
+    rg.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = rg;
+    g.fillRect(0, 0, S, S);
+  } else {
+    g.translate(S / 2, S / 2);
+    g.rotate(-0.4);
+    g.fillStyle = '#fff';
+    g.beginPath();
+    g.ellipse(0, 0, S * 0.30, S * 0.16, 0, 0, Math.PI * 2);
+    g.fill();
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// 粒子活动上限高度：粒子若高过地平线，会在天空里读成星星而不是花瓣
+function particleCeil() { return Math.min(4.5, CONFIG.anim.particles.bounds * 0.2); }
+
+let particles = null;
+{
+  const cfg = CONFIG.anim.particles;
+  const n = IS_MOBILE ? Math.min(cfg.count, 150) : cfg.count;
+  const arr = new Float32Array(n * 3);
+  const phase = new Float32Array(n);
+  const b = cfg.bounds;
+  const ceil = particleCeil();          // 限制在近地高度，避免飘到天空里像星星
+  for (let i = 0; i < n; i++) {
+    arr[i * 3] = (Math.random() - 0.5) * b;
+    arr[i * 3 + 1] = Math.random() * ceil;
+    arr[i * 3 + 2] = (Math.random() - 0.5) * b;
+    phase[i] = Math.random() * Math.PI * 2;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  geo.userData.phase = phase;
+
+  const mat = new THREE.PointsMaterial({
+    size: cfg.size,
+    map: makeParticleTexture(cfg.mode),
+    transparent: true,
+    opacity: cfg.opacity,
+    depthWrite: false,
+    alphaTest: 0.02,
+    sizeAttenuation: true,
+    blending: THREE.NormalBlending,
+  });
+  particles = new THREE.Points(geo, mat);
+  particles.frustumCulled = false;
+  world.add(particles);
+}
+
+function updateParticles(pts, dt, t) {
+  const cfg = CONFIG.anim.particles;
+  const attr = pts.geometry.attributes.position;
+  const phase = pts.geometry.userData.phase;
+  const b = cfg.bounds;
+  for (let i = 0; i < attr.count; i++) {
+    let x = attr.getX(i), y = attr.getY(i), z = attr.getZ(i);
+    y -= cfg.fall * dt;
+    x += Math.sin(t * 0.6 + phase[i]) * cfg.drift * dt;
+    z += Math.cos(t * 0.4 + phase[i]) * cfg.drift * 0.6 * dt;
+    if (y < 0) {
+      y = particleCeil();
+      x = (Math.random() - 0.5) * b;
+      z = (Math.random() - 0.5) * b;
+    }
+    attr.setXYZ(i, x, y, z);
+  }
+  attr.needsUpdate = true;
+}
+
+/* ============================================================
+ * 5. 后处理：Bloom → 调色 → OutputPass（顺序不可改）
+ * ============================================================ */
+const GradeShader = {
+  uniforms: {
+    tDiffuse:       { value: null },
+    uSaturation:    { value: CONFIG.post.grade.saturation },
+    uContrast:      { value: CONFIG.post.grade.contrast },
+    uLift:          { value: CONFIG.post.grade.lift },
+    uShadowTint:    { value: new THREE.Color(CONFIG.post.grade.shadowTint) },
+    uHighlightTint: { value: new THREE.Color(CONFIG.post.grade.highlightTint) },
+    uTintMix:       { value: CONFIG.post.grade.tintMix },
+    uVignette:      { value: CONFIG.post.vignette.amount },
+    uVigSoft:       { value: CONFIG.post.vignette.softness },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform float uSaturation, uContrast, uLift, uTintMix, uVignette, uVigSoft;
+    uniform vec3  uShadowTint, uHighlightTint;
+    varying vec2  vUv;
+    void main() {
+      vec4  c = texture2D(tDiffuse, vUv);
+      vec3  col = c.rgb;
+      float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      vec3  tint = mix(uShadowTint, uHighlightTint, smoothstep(0.0, 0.7, l));
+      col = mix(col, col * tint * 1.6, uTintMix);          // 暗部偏冷、亮部偏暖
+      col = mix(vec3(l), col, uSaturation);
+      col = (col - 0.18) * uContrast + 0.18 + uLift;       // 绕线性中灰做对比
+      vec2  p = vUv - 0.5;
+      float v = 1.0 - uVignette * smoothstep(0.2, 1.0 - uVigSoft * 0.2, length(p) * 1.42);
+      col *= v;
+      gl_FragColor = vec4(max(col, 0.0), c.a);             // 不做 gamma，交给 OutputPass
+    }`,
+};
+
+const bloomOn = CONFIG.post.enabled && (!IS_MOBILE || CONFIG.perf.bloomOnMobile);
+let composer = null, bloom = null;
+
+if (CONFIG.post.enabled) {
+  composer = new EffectComposer(renderer);
+  composer.setSize(VS.w, VS.h);
+  composer.addPass(new RenderPass(scene, camera));
+
+  bloom = new UnrealBloomPass(
+    new THREE.Vector2(VS.w, VS.h),
+    CONFIG.post.bloom.strength,
+    CONFIG.post.bloom.radius,
+    CONFIG.post.bloom.threshold,
+  );
+  bloom.enabled = bloomOn;
+  composer.addPass(bloom);
+
+  const gradePass = new ShaderPass(GradeShader);
+  gradePass.enabled = true;
+  composer.addPass(gradePass);
+
+  composer.addPass(new OutputPass());   // 必须最后，唯一一次线性 → sRGB
+}
+
+/* ============================================================
+ * 6. 交互：视差（作用在世界组）+ 空闲自动环绕
+ * ============================================================ */
+const pointer = { x: 0, y: 0, tx: 0, ty: 0 };
+let lastInteract = performance.now();
+
+function onPointerMove(e) {
+  const { w, h } = viewSize();
+  pointer.tx = (e.clientX / w) * 2 - 1;
+  pointer.ty = (e.clientY / h) * 2 - 1;
+}
+function onPointerLeave() { pointer.tx = 0; pointer.ty = 0; }
+function onControlStart() { lastInteract = performance.now(); }
+function onControlEnd()   { lastInteract = performance.now(); }
+
+renderer.domElement.addEventListener('pointermove', onPointerMove);
+renderer.domElement.addEventListener('pointerleave', onPointerLeave);
+controls.addEventListener('start', onControlStart);
+controls.addEventListener('end', onControlEnd);
+
+/* ============================================================
+ * 7. resize / 自适应降级
+ * ============================================================ */
+function onResize() {
+  const { w, h } = viewSize();
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  if (composer) composer.setSize(w, h);
+  syncOutlineWidth();                    // 视口高度变了，描边像素宽度要重算
+}
+addEventListener('resize', onResize);
+
+const quality = { level: 0, frames: 0, elapsed: 0, fps: 60 };
+function tickQuality(dt) {
+  if (!CONFIG.perf.adaptive.enabled) return;
+  quality.frames++;
+  quality.elapsed += dt;
+  if (quality.elapsed < CONFIG.perf.adaptive.window) return;
+
+  quality.fps = quality.frames / quality.elapsed;
+  quality.frames = 0;
+  quality.elapsed = 0;
+  if (quality.fps >= CONFIG.perf.adaptive.minFps) return;
+
+  quality.level++;
+  if (quality.level === 1) renderer.setPixelRatio(1);
+  if (quality.level === 2 && bloom) bloom.enabled = false;
+  if (quality.level === 3) renderer.shadowMap.enabled = false;
+  if (quality.level === 4) {
+    scene.traverse((o) => { if (o.material === outlineMaterial) o.visible = false; });
+  }
+  console.info(`[perf] 降级到 L${quality.level}，实测 ${quality.fps.toFixed(1)} fps`);
+}
+
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  fallbackEl.style.display = 'grid';
+});
+
+/* ============================================================
+ * 8. 动画循环
+ * ============================================================ */
+const clock = new THREE.Clock();
+syncOutlineWidth();
+
+let hudFrame = 0;
+function updateHUD() {
+  hudFrame++;
+  if (hudFrame % 12 !== 0) return;   // 每 12 帧刷一次，避免 DOM 抖动
+
+  const m = measureFrame(subject);
+  hudEl.textContent =
+    `${CONFIG.meta.title}   FOV ${CONFIG.camera.fov}   DPR ${renderer.getPixelRatio().toFixed(2)}\n` +
+    `主体 cx ${m.cx.toFixed(3)}  cy ${m.cy.toFixed(3)}   (容差 ±0.040)\n` +
+    `占比 w  ${m.w.toFixed(3)}  h  ${m.h.toFixed(3)}   (容差 ±0.050)\n` +
+    `地平线 y ${m.horizonY === null ? '—' : m.horizonY.toFixed(3)}   (容差 ±0.030)\n` +
+    `FPS ${quality.fps.toFixed(0)}   降级 L${quality.level}`;
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);   // 夹住，切标签页回来不瞬移
+  const t = clock.elapsedTime;
+
+  for (const s of windShaders) s.uniforms.uTime.value = t;
+  if (particles && !REDUCED) updateParticles(particles, dt, t);
+
+  // 视差：移动世界而非相机，避免与 OrbitControls 抢相机位姿
+  const { amount, ease } = CONFIG.camera.parallax;
+  pointer.x += (pointer.tx - pointer.x) * ease;
+  pointer.y += (pointer.ty - pointer.y) * ease;
+  world.position.x = -pointer.x * amount;
+  world.position.y = pointer.y * amount * 0.4;
+
+  if (CONFIG.anim.autoRotate.enabled && !REDUCED) {
+    const idle = (performance.now() - lastInteract) / 1000;
+    controls.autoRotate = idle > CONFIG.anim.autoRotate.idleDelay;
+  }
+
+  controls.update();
+  tickQuality(dt);
+
+  if (composer) composer.render();
+  else renderer.render(scene, camera);
+
+  if (CONFIG.debug.hud) updateHUD();
+}
+animate();
+
+/* ============================================================
+ * 9. 对外探针：便于在控制台核对构图与参数
+ * ============================================================ */
+window.__SCENE = { THREE, CONFIG, scene, camera, renderer, controls, subject, composer, measureFrame, quality };
+
+function onUnload() {
+  removeEventListener('resize', onResize);
+  renderer.domElement.removeEventListener('pointermove', onPointerMove);
+  renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
+  controls.removeEventListener('start', onControlStart);
+  controls.removeEventListener('end', onControlEnd);
+  renderer.dispose();
+}
+addEventListener('pagehide', onUnload, { once: true });
+</script>
+</body>
+</html>

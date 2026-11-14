@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "复制到 scenes/<slug>/ 后，按 Stage 0 的语义色板改写。不要直接沿用本文件的示例值。",
+    "box 为归一化坐标 [x0, y0, x1, y1]，原点在左上角。",
+    "predicate 是 JS 风格的三通道布尔表达式，可用变量只有 r / g / b。",
+    "tol 是「与参考图同区域占比之差」的允许偏差，单位百分点。"
+  ],
+  "regions": [
+    {
+      "name": "主体区",
+      "box": [0.25, 0.18, 0.82, 0.92],
+      "features": [
+        { "name": "主体特征色", "predicate": "r>105 && r>g*1.55 && r>b*1.55", "tol": 9 }
+      ]
+    },
+    {
+      "name": "前景区",
+      "box": [0.0, 0.58, 1.0, 1.0],
+      "features": [
+        { "name": "前景特征色", "predicate": "g>105 && g>r*1.05 && g>b*1.08", "tol": 9 }
+      ]
+    }
+  ],
+  "global": {
+    "lumTol": 22,
+    "overMax": 1.5,
+    "deadMax": 2.0,
+    "curveMin": 12
+  },
+  "curveKeys": [
+    "quadraticCurveTo",
+    "bezierCurveTo",
+    "absarc",
+    "LatheGeometry",
+    "TubeGeometry",
+    "TorusGeometry",
+    "ExtrudeGeometry",
+    "Shape("
+  ]
+}
